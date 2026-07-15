@@ -1,10 +1,15 @@
 import { ForbiddenException, Injectable, NotFoundException } from '@nestjs/common';
 import { PrismaService } from '../prisma/prisma.service';
 import { ChannelType } from '@prisma/client';
+import { KafkaService } from '../kafka/kafka.service';
+import { KAFKA_TOPICS, ChatMessageEvent } from '../kafka/topics';
 
 @Injectable()
 export class ChatService {
-  constructor(private readonly prisma: PrismaService) {}
+  constructor(
+    private readonly prisma: PrismaService,
+    private readonly kafka: KafkaService,
+  ) {}
 
   async createChannel(creatorId: string, memberIds: string[], name?: string) {
     const allMembers = Array.from(new Set([creatorId, ...memberIds]));
@@ -64,10 +69,26 @@ export class ChatService {
 
   async saveMessage(channelId: string, senderId: string, content: string) {
     await this.assertMembership(channelId, senderId);
-    return this.prisma.message.create({
+    const message = await this.prisma.message.create({
       data: { channelId, senderId, content, status: 'SENT' },
       include: { sender: { select: { id: true, username: true, avatarUrl: true } } },
     });
+
+    // Postgres is still the source of truth (already written above). Publishing
+    // to Kafka here just fans this event out to whoever else cares — Notification
+    // and Analytics services consume it independently, asynchronously.
+    const event: ChatMessageEvent = {
+      eventType: 'message.sent',
+      messageId: message.id,
+      channelId,
+      senderId,
+      senderUsername: message.sender.username,
+      content: message.content,
+      createdAt: message.createdAt.toISOString(),
+    };
+    await this.kafka.publish(KAFKA_TOPICS.CHAT_MESSAGES, channelId, event);
+
+    return message;
   }
 
   async markDelivered(messageId: string) {

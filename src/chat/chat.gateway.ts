@@ -7,14 +7,17 @@ import {
   WebSocketGateway,
   WebSocketServer,
 } from '@nestjs/websockets';
-import { Logger, UsePipes, ValidationPipe } from '@nestjs/common';
+import { Logger, OnModuleInit, UsePipes, ValidationPipe } from '@nestjs/common';
 import { ConfigService } from '@nestjs/config';
 import { JwtService } from '@nestjs/jwt';
 import { Server, Socket } from 'socket.io';
 import { ChatService } from './chat.service';
-import { PresenceService } from '../presence/presence.service';
+import { PresenceService, PresenceStatus } from '../presence/presence.service';
+import { RedisService } from '../redis/redis.service';
 import { SendMessageDto } from './dto/send-message.dto';
 import { CreateChannelDto, JoinChannelDto } from './dto/channel.dto';
+
+const PRESENCE_CHANNEL = 'presence:broadcast';
 
 interface AuthedSocket extends Socket {
   data: {
@@ -27,7 +30,7 @@ interface AuthedSocket extends Socket {
   namespace: '/chat',
 })
 @UsePipes(new ValidationPipe({ whitelist: true, transform: true }))
-export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
+export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect, OnModuleInit {
   @WebSocketServer()
   server: Server;
 
@@ -36,9 +39,37 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   constructor(
     private readonly chatService: ChatService,
     private readonly presenceService: PresenceService,
+    private readonly redis: RedisService,
     private readonly jwt: JwtService,
     private readonly config: ConfigService,
   ) {}
+
+  /**
+   * Subscribe once to a shared Redis channel for presence updates. Whichever
+   * backend instance a change originates on publishes here; every instance
+   * (including this one) re-broadcasts to its own locally-connected sockets.
+   * This is what lets presence work correctly once you run more than one
+   * instance of this server behind a load balancer.
+   */
+  onModuleInit() {
+    this.redis.subscriber.subscribe(PRESENCE_CHANNEL, (err) => {
+      if (err) this.logger.error(`Failed to subscribe to ${PRESENCE_CHANNEL}: ${err.message}`);
+    });
+
+    this.redis.subscriber.on('message', (channel, message) => {
+      if (channel !== PRESENCE_CHANNEL) return;
+      try {
+        const payload = JSON.parse(message);
+        this.server.emit('presence:update', payload);
+      } catch {
+        this.logger.warn('Received malformed presence message');
+      }
+    });
+  }
+
+  private async broadcastPresence(userId: string, status: PresenceStatus) {
+    await this.redis.publisher.publish(PRESENCE_CHANNEL, JSON.stringify({ userId, status }));
+  }
 
   async handleConnection(client: AuthedSocket) {
     try {
@@ -71,7 +102,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     }
 
     await this.presenceService.setStatus(userId, 'online');
-    this.server.emit('presence:update', { userId, status: 'online' });
+    await this.broadcastPresence(userId, 'online');
 
     this.logger.log(`User ${client.data.user.username} connected (${client.id})`);
   }
@@ -81,7 +112,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
     if (!user) return;
 
     await this.presenceService.clearStatus(user.id);
-    this.server.emit('presence:update', { userId: user.id, status: 'offline' });
+    await this.broadcastPresence(user.id, 'offline');
     this.logger.log(`User ${user.username} disconnected (${client.id})`);
   }
 
@@ -97,7 +128,7 @@ export class ChatGateway implements OnGatewayConnection, OnGatewayDisconnect {
   ) {
     const userId = client.data.user.id;
     await this.presenceService.setStatus(userId, body.status);
-    this.server.emit('presence:update', { userId, status: body.status });
+    await this.broadcastPresence(userId, body.status);
   }
 
   @SubscribeMessage('channel:create')
