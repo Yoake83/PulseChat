@@ -1,0 +1,17 @@
+{
+  "name": "pulsechat-notification-service",
+  "version": "0.1.0",
+  "description": "Kafka consumer: notifies offline channel members when a message is sent",
+  "main": "src/index.js",
+  "type": "commonjs",
+  "scripts": {
+    "start": "node src/index.js",
+    "start:dev": "node --watch src/index.js"
+  },
+  "dependencies": {
+    "dotenv": "^16.4.5",
+    "ioredis": "^5.4.1",
+    "kafkajs": "^2.2.4",
+    "pg": "^8.13.0"
+  }
+}
